@@ -1,623 +1,838 @@
-import streamlit as st
-import pandas as pd
+import os
+import io
+from datetime import datetime, timedelta
+
 import numpy as np
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
-import json
-import io
-from source import *
+import streamlit as st
 
-# --- Streamlit Page Configuration ---
+from source import *  # AIDecisionLogger + simulation + detection + reporting
+
+# =============================================================================
+# Page configuration
+# =============================================================================
 st.set_page_config(page_title="QuLab: Lab 39: Audit Logging Demo", layout="wide")
-st.sidebar.image("https://www.quantuniversity.com/assets/img/logo5.jpg")
-st.sidebar.divider()
-st.title("QuLab: Lab 39: Audit Logging Demo")
-st.divider()
 
-# --- Session State Initialization ---
+# =============================================================================
+# Pedagogy-first UI helpers (non-technical language)
+# =============================================================================
+def callout(title: str, body: str, kind: str = "info"):
+    if kind == "info":
+        st.info(f"**{title}**\n\n{body}")
+    elif kind == "warning":
+        st.warning(f"**{title}**\n\n{body}")
+    elif kind == "success":
+        st.success(f"**{title}**\n\n{body}")
+    else:
+        st.write(f"**{title}**\n\n{body}")
+
+def assumptions_box(lines):
+    st.caption("**Assumptions (for interpretation)**")
+    st.markdown("\n".join([f"- {x}" for x in lines]))
+
+def evidence_box(lines):
+    st.caption("**Evidence / Documentation you should expect**")
+    st.markdown("\n".join([f"- {x}" for x in lines]))
+
+def pct(x: float) -> str:
+    if pd.isna(x):
+        return "—"
+    return f"{100*x:.1f}%"
+
+def start_here_path():
+    st.markdown("### Start Here: A governance-first learning path")
+    st.markdown(
+        """
+1) **Generate a decision stream** (like production throughput)  
+2) **Run transparent monitoring checks** and write alerts to the audit log  
+3) **Triage the dashboard** like a Risk Officer (what changed? what needs review?)  
+4) **Produce a committee-ready report** (evidence + sign-off)
+        """.strip()
+    )
+
+def checkpoint_question(question: str, options: list, correct_option: str, explanation: str):
+    st.markdown("#### Checkpoint (test your intuition)")
+    ans = st.radio(question, options, index=None)
+    if ans is None:
+        st.caption("Pick one option to see the explanation.")
+        return
+    if ans == correct_option:
+        st.success(f"Correct. {explanation}")
+    else:
+        st.info(f"Not quite. {explanation}")
+
+def compute_logging_coverage(decisions_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Coverage = % non-null for key governance fields.
+    This is a *learning* metric: if coverage is low, the log is not defensible.
+    """
+    if decisions_df is None or decisions_df.empty:
+        return pd.DataFrame(columns=["Field", "Coverage"])
+    key_fields = [
+        "timestamp",
+        "model_name",
+        "model_version",
+        "input_hash",
+        "input_features",
+        "prediction",
+        "confidence",
+        "explanation",
+        "portfolio_id",
+        "user_id",
+        "review_status",
+        "review_notes",
+        "anomaly_flag",
+        "anomaly_reason",
+    ]
+    present = [c for c in key_fields if c in decisions_df.columns]
+    rows = [{"Field": c, "Coverage": decisions_df[c].notna().mean()} for c in present]
+    return pd.DataFrame(rows).sort_values("Coverage")
+
+# =============================================================================
+# Session state initialization
+# =============================================================================
+DB_PATH = "finsecure_ai_audit_log.db"
+
 def initialize_session_state():
-    if 'logger' not in st.session_state:
-        # Use the pre-initialized logger instance from source.py
-        st.session_state['logger'] = logger
-        # Ensure tables are created on first run or after reset
+    if "logger" not in st.session_state:
+        st.session_state["logger"] = AIDecisionLogger(db_path=DB_PATH)
         st.session_state.logger._create_tables()
-        st.session_state['app_initialized'] = False # Flag to run initial simulation only once
 
-    if 'page' not in st.session_state:
-        st.session_state['page'] = "Home"
+    if "page" not in st.session_state:
+        st.session_state["page"] = "Home"
 
-    # Simulation parameters
-    if 'total_simulation_days' not in st.session_state:
-        st.session_state['total_simulation_days'] = 6
-    if 'anomaly_trigger_day' not in st.session_state:
-        st.session_state['anomaly_trigger_day'] = 4 # 1-indexed for UI
-    if 'n_trading_decisions_per_day' not in st.session_state:
-        st.session_state['n_trading_decisions_per_day'] = 50
-    if 'n_credit_decisions_per_day' not in st.session_state:
-        st.session_state['n_credit_decisions_per_day'] = 100
+    # Simulation defaults (chosen to demonstrate the learning narrative)
+    st.session_state.setdefault("total_simulation_days", 6)
+    st.session_state.setdefault("anomaly_trigger_day", 4)  # 1-indexed for UI
+    st.session_state.setdefault("n_trading_decisions_per_day", 50)
+    st.session_state.setdefault("n_credit_decisions_per_day", 100)
 
-    # Model monitoring
-    if 'models_to_monitor' not in st.session_state:
-        st.session_state['models_to_monitor'] = ['MomentumSignal', 'CreditXGBoost']
+    # Monitoring defaults
+    st.session_state.setdefault("recent_window_days", 2)
+    st.session_state.setdefault("baseline_window_days", 4)
 
-    # Dashboard parameters
-    if 'selected_dashboard_model' not in st.session_state:
-        st.session_state['selected_dashboard_model'] = st.session_state['models_to_monitor'][0] if st.session_state['models_to_monitor'] else None
-    if 'dashboard_review_period' not in st.session_state:
-        st.session_state['dashboard_review_period'] = 7
+    # Dashboard controls
+    st.session_state.setdefault("selected_dashboard_model", None)
+    st.session_state.setdefault("dashboard_review_period", 7)
 
-    # Anomaly Detection parameters
-    if 'ad_window_days' not in st.session_state:
-        st.session_state['ad_window_days'] = 1
-    if 'ad_baseline_days' not in st.session_state:
-        st.session_state['ad_baseline_days'] = 5
+    # Report controls
+    st.session_state.setdefault("audit_report_period", 14)
 
-    # Audit Report parameters
-    if 'audit_report_period' not in st.session_state:
-        st.session_state['audit_report_period'] = 7
-    if 'generated_audit_report' not in st.session_state:
-        st.session_state['generated_audit_report'] = {}
-
-    # DataFrames for display (cached/updated on demand)
-    if 'current_decisions_df' not in st.session_state:
-        st.session_state['current_decisions_df'] = pd.DataFrame()
-    if 'current_alerts_df' not in st.session_state:
-        st.session_state['current_alerts_df'] = pd.DataFrame()
+    # Cached dataframes
+    st.session_state.setdefault("current_decisions_df", pd.DataFrame())
+    st.session_state.setdefault("current_alerts_df", pd.DataFrame())
 
 initialize_session_state()
 
-# --- Common functions for data retrieval and state update ---
-def update_decision_review_status(decision_id, new_status, review_notes):
-    """Updates the review status and notes for a specific decision."""
-    try:
-        current_time = datetime.now().isoformat()
-        st.session_state.logger.conn.execute(
-            '''UPDATE decisions SET review_status = ?, review_notes = ?, review_date = ?, reviewed_by = ? WHERE id = ?''',
-            (new_status, review_notes, current_time, "Alex Chen", decision_id)
-        )
-        st.session_state.logger.conn.commit()
-        st.success(f"Decision {decision_id} updated to '{new_status}'.")
-        # Invalidate current decisions data to trigger refresh on next access
-        st.session_state['current_decisions_df'] = pd.DataFrame()
-    except Exception as e:
-        st.error(f"Error updating decision {decision_id}: {e}")
+# =============================================================================
+# Data access helpers (pull via SQL, because the logger exposes model-filtered helpers)
+# =============================================================================
+def get_decisions_df() -> pd.DataFrame:
+    if st.session_state.current_decisions_df is None or st.session_state.current_decisions_df.empty:
+        try:
+            df = pd.read_sql_query("SELECT * FROM decisions", st.session_state.logger.conn)
+            st.session_state.current_decisions_df = df
+        except Exception:
+            st.session_state.current_decisions_df = pd.DataFrame()
+    return st.session_state.current_decisions_df
 
-def acknowledge_alert(alert_id, acknowledged_by="Alex Chen"):
-    """Acknowledges a specific alert."""
+def get_alerts_df() -> pd.DataFrame:
+    if st.session_state.current_alerts_df is None or st.session_state.current_alerts_df.empty:
+        try:
+            df = pd.read_sql_query("SELECT * FROM alerts", st.session_state.logger.conn)
+            st.session_state.current_alerts_df = df
+        except Exception:
+            st.session_state.current_alerts_df = pd.DataFrame()
+    return st.session_state.current_alerts_df
+
+def invalidate_caches():
+    st.session_state.current_decisions_df = pd.DataFrame()
+    st.session_state.current_alerts_df = pd.DataFrame()
+
+# =============================================================================
+# Actions (non-technical descriptions; the work happens under the hood)
+# =============================================================================
+def reset_demo():
+    """Clear the demo database so the learning path can be rerun cleanly."""
+    try:
+        # Close current connection
+        try:
+            st.session_state.logger.conn.close()
+        except Exception:
+            pass
+
+        # Remove db file if present
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+
+        # Recreate logger + tables
+        st.session_state["logger"] = AIDecisionLogger(db_path=DB_PATH)
+        st.session_state.logger._create_tables()
+
+        invalidate_caches()
+        st.success("Demo reset: audit log cleared and ready for a fresh run.")
+    except Exception as e:
+        st.error(f"Reset failed: {e}")
+
+def acknowledge_alert(alert_id: int, acknowledged_by: str):
+    """Mark an alert as triaged (ownership taken)."""
     try:
         st.session_state.logger.conn.execute(
-            '''UPDATE alerts SET acknowledged = 1, acknowledged_by = ? WHERE id = ?''',
-            (acknowledged_by, alert_id)
+            "UPDATE alerts SET acknowledged = 1, acknowledged_by = ? WHERE id = ?",
+            (acknowledged_by, alert_id),
         )
         st.session_state.logger.conn.commit()
+        invalidate_caches()
         st.success(f"Alert {alert_id} acknowledged by {acknowledged_by}.")
-        # Invalidate current alerts data to trigger refresh on next access
-        st.session_state['current_alerts_df'] = pd.DataFrame()
     except Exception as e:
         st.error(f"Error acknowledging alert {alert_id}: {e}")
 
-# --- Navigation ---
+# =============================================================================
+# Sidebar + Navigation
+# =============================================================================
+st.sidebar.image("https://www.quantuniversity.com/assets/img/logo5.jpg")
+st.sidebar.divider()
 st.sidebar.title("AI Model Governance Platform")
-st.sidebar.header("Navigation")
+st.sidebar.caption("Audience: CFA charterholders • PMs • risk & research")
 
-# Define the options
-nav_options = ["Home", "Simulation & Data Generation", "Anomaly Detection", "Risk Officer Dashboard", "Audit Report"]
+nav_options = [
+    "Home",
+    "Simulation & Data Generation",
+    "Anomaly Detection",
+    "Risk Officer Dashboard",
+    "Audit Report",
+]
 
-# Determine the index of the current page in the options list
 try:
-    current_index = nav_options.index(st.session_state.get('page', "Home"))
+    current_index = nav_options.index(st.session_state.get("page", "Home"))
 except ValueError:
     current_index = 0
 
-# Use 'index' to set the default value properly
-selected_page = st.sidebar.selectbox(
-    "Choose a section",
-    nav_options,
-    index=current_index
-)
-
-# Update session state if the selection changes
-if selected_page != st.session_state['page']:
-    st.session_state['page'] = selected_page
+selected_page = st.sidebar.selectbox("Choose a section", nav_options, index=current_index)
+if selected_page != st.session_state["page"]:
+    st.session_state["page"] = selected_page
     st.rerun()
 
-# --- Page: Home ---
-if st.session_state['page'] == "Home":
-    st.title("AI Model Governance: Proactive Monitoring and Anomaly Detection for Financial Professionals")
+# =============================================================================
+# Global header
+# =============================================================================
+st.title("QuLab: Lab 39 — Audit Logging Demo")
+st.divider()
 
-    st.markdown(f"")
-    st.markdown(f"## Introduction: Mr. Alex Chen, Risk Officer at FinSecure Bank")
-    st.markdown(f"Welcome to FinSecure Bank, a leading financial institution leveraging AI for critical operations like automated trading signal generation and credit approvals. You are **Mr. Alex Chen, a seasoned Risk Officer** responsible for ensuring that the bank's AI models operate within acceptable risk parameters, comply with internal governance policies (e.g., Model Risk Management guidelines like SR 11-7), and meet external regulatory requirements (e.g., EU AI Act Article 12).")
-    st.markdown(f"FinSecure's AI models generate thousands of decisions daily. Reviewing each decision manually is impossible and inefficient. Your primary challenge is to implement a robust, scalable system that continuously monitors these AI decisions, automatically detects anomalous behavior, and provides the necessary tools for investigation and reporting, thereby proactively mitigating potential financial losses or regulatory penalties.")
-    st.markdown(f"This application walks you through the practical steps Alex would take to build and utilize such a system, focusing on:")
-    st.markdown(f"1.  **Establishing a comprehensive audit log** for all AI decisions.")
-    st.markdown(f"2.  **Implementing non-invasive logging** to integrate with existing models.")
-    st.markdown(f"3.  **Simulating real-world AI decisions**, including carefully injected anomalies.")
-    st.markdown(f"4.  **Developing automated anomaly detection algorithms** to flag deviations from normal behavior.")
-    st.markdown(f"5.  **Creating an interactive monitoring dashboard** for quick risk assessment.")
-    st.markdown(f"6.  **Generating a periodic audit report** for compliance and stakeholder communication.")
+# =============================================================================
+# PAGE 1: HOME
+# =============================================================================
+if st.session_state["page"] == "Home":
+    st.header("Audit Logging for AI Decisions: Reconstruct, Monitor, and Defend Model Actions")
 
-    st.markdown(f"---")
-    st.markdown(f"### 2. Building the Foundation: The AI Decision Audit Log Database")
-    st.markdown(f"As a Risk Officer, Alex knows that the cornerstone of effective AI governance is a comprehensive, immutable audit log. Regulatory frameworks like SR 11-7 and the EU AI Act Article 12 explicitly mandate the automatic recording of events and decisions by high-risk AI systems. This log serves as the single source of truth for every AI decision, capturing crucial metadata, inputs, outputs, and explanations. Without such a log, FinSecure Bank cannot reconstruct past decisions, investigate incidents, or demonstrate compliance.")
-    st.markdown(f"Alex needs a structured database to store:")
-    st.markdown(f"1.  **Decision records**: Every AI model's output, along with its context.")
-    st.markdown(f"2.  **Alert records**: Any detected anomalies or deviations from expected behavior.")
-    st.markdown(f"He will use SQLite for simplicity in this demonstration, but in a real-world scenario, this could be a more robust enterprise database.")
-    st.markdown(f"**Concept:** Structured Logging Schema")
-    st.markdown(f"The schema for the `decisions` table must capture all relevant details to reconstruct and review any AI decision. Key fields include: `timestamp`, `model_name`, `model_version`, `decision_type`, `input_features`, `input_hash`, `prediction`, `confidence`, `explanation`, `ticker`, `sector`, `portfolio_id`, `user_id`, `review_status`, `anomaly_flag`.")
-    st.markdown(f"Similarly, the `alerts` table tracks detected anomalies with `alert_type`, `severity`, `description`, and `model_name`.")
+    start_here_path()
 
-    st.markdown(f"---")
-    st.markdown(f"### 3. Non-Invasive Decision Capture with Decorators")
-    st.markdown(f"Integrating audit logging into existing production AI models can be complex. Model development teams often prioritize prediction accuracy and performance. The governance team, led by Alex, needs to ensure logging without directly modifying the sensitive, validated model code. Modifying core model logic introduces risk and requires re-validation.")
-    st.markdown(f"To address this, Alex decided to implement a **non-invasive logging wrapper using a Python decorator**. This architectural pattern allows the governance team to 'decorate' any prediction function, injecting logging capabilities without altering the original function's source code. This separation of concerns is a best practice in robust MLOps.")
-    st.markdown(f"**Concept:** Decorator Pattern for Non-Invasive Logging")
-    st.markdown(f"A decorator `@audit_logged` will:")
-    st.markdown(f"1.  Take a model's prediction function as input.")
-    st.markdown(f"2.  Wrap it with a new function that calls the original prediction function.")
-    st.markdown(f"3.  Extract relevant metadata from the prediction's inputs and outputs.")
-    st.markdown(f"4.  Log this metadata to the `AIDecisionLogger`.")
-    st.markdown(f"5.  Return the original prediction result, ensuring the model's behavior is unchanged.")
-
-    if not st.session_state['app_initialized']:
-        with st.spinner("Initializing audit log database and simulating initial data..."):
-            # Initial simulation upon first load
-            for day_idx in range(st.session_state['total_simulation_days']):
-                is_anomaly = (day_idx == st.session_state['anomaly_trigger_day'] - 1)
-                simulate_production_day(st.session_state.logger,
-                                        n_trading=st.session_state['n_trading_decisions_per_day'],
-                                        n_credit=st.session_state['n_credit_decisions_per_day'],
-                                        anomaly_day=is_anomaly)
-            st.session_state['app_initialized'] = True
-        st.success("Initial data simulation complete! Navigate to 'Risk Officer Dashboard' to see monitoring insights, or 'Anomaly Detection' to run checks!")
-    else:
-        st.info("Application is initialized with simulated data. Navigate to other sections!")
-
-# --- Page: Simulation & Data Generation ---
-elif st.session_state['page'] == "Simulation & Data Generation":
-    st.title("Simulating AI Decisions with Injected Anomalies")
-
-    st.markdown(f"As Mr. Alex Chen, to validate the anomaly detection capabilities, you need to test the system with real-world scenarios, including days where models behave abnormally. Simulating production decisions allows you to control the environment and inject specific types of anomalies to ensure the monitoring system effectively flags them. This proactive testing is crucial for gaining confidence in the governance framework before live incidents occur.")
-    st.markdown(f"You will simulate several days of trading signals and credit approvals, intentionally introducing anomalous behavior on one of these days to see if the detection system catches it.")
-    st.markdown(f"**Concept:** Synthetic Data Generation with Injected Anomalies")
-    st.markdown(f"The simulation will generate:")
-    st.markdown(f"-   **Normal decisions**: Following expected patterns for `momentum_12m`, `fico`, `dti`.")
-    st.markdown(f"-   **Injected anomalies**:")
-    st.markdown(f"    -   **Trading Model Anomaly**: A sudden shift in recommendations, e.g., an unusually high proportion of 'SELL' signals. This is simulated by forcing `momentum_12m` to a low value for many decisions on an 'anomaly day'.")
-    st.markdown(f"    -   **Credit Model Anomaly**: A subtle shift in approval criteria, e.g., approving a higher number of applicants with low FICO scores. This is simulated by lowering the `fico` score for some approved applications on the 'anomaly day'.")
-
-    st.subheader("Simulation Parameters")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.session_state['total_simulation_days'] = st.number_input(
-            "Total simulation days",
-            min_value=1, value=st.session_state['total_simulation_days'], step=1
-        )
-    with col2:
-        st.session_state['anomaly_trigger_day'] = st.number_input(
-            "Anomaly day (1-indexed)",
-            min_value=1, max_value=st.session_state['total_simulation_days'],
-            value=st.session_state['anomaly_trigger_day'], step=1
-        )
-    col3, col4 = st.columns(2)
-    with col3:
-        st.session_state['n_trading_decisions_per_day'] = st.number_input(
-            "Trading decisions per day",
-            min_value=10, value=st.session_state['n_trading_decisions_per_day'], step=10
-        )
-    with col4:
-        st.session_state['n_credit_decisions_per_day'] = st.number_input(
-            "Credit decisions per day",
-            min_value=10, value=st.session_state['n_credit_decisions_per_day'], step=10
+    colA, colB = st.columns([3, 2], vertical_alignment="top")
+    with colA:
+        st.markdown("### Role-play scenario (finance-native)")
+        st.markdown(
+            """
+You are **Mr. Alex Chen**, Risk Officer at **FinSecure Bank**.  
+The bank uses AI models for (i) **trading signals** and (ii) **credit approvals**.  
+Your job is to ensure these models remain within acceptable risk boundaries and are **audit-defensible** under internal governance (e.g., SR 11‑7 style monitoring) and external expectations (e.g., EU AI Act Article 12-style logging).
+            """.strip()
         )
 
-
-    st.markdown(f"---")
-    st.subheader("Generate Decisions")
-    if st.button("Run New Simulation and Generate Decisions"):
-        with st.spinner(f"Clearing existing data and simulating {st.session_state['total_simulation_days']} days of AI decisions..."):
-            # Clear existing data before new simulation to avoid duplicates
-            st.session_state.logger.conn.execute("DELETE FROM decisions")
-            st.session_state.logger.conn.execute("DELETE FROM alerts")
-            st.session_state.logger.conn.commit()
-
-            for day_idx in range(st.session_state['total_simulation_days']):
-                is_anomaly = (day_idx == st.session_state['anomaly_trigger_day'] - 1)
-                simulate_production_day(st.session_state.logger,
-                                        n_trading=st.session_state['n_trading_decisions_per_day'],
-                                        n_credit=st.session_state['n_credit_decisions_per_day'],
-                                        anomaly_day=is_anomaly)
-            st.session_state['app_initialized'] = True # Confirm re-initialization
-        st.success("Decision simulation complete and data logged!")
-
-    st.subheader("Simulated Decisions Overview")
-    st.session_state['current_decisions_df'] = st.session_state.logger.get_decisions(days=st.session_state['total_simulation_days'], limit=5000)
-    if not st.session_state['current_decisions_df'].empty:
-        st.markdown(f"Total logged decisions over the last {st.session_state['total_simulation_days']} days: **{len(st.session_state['current_decisions_df'])}**")
-        st.dataframe(st.session_state['current_decisions_df'].sort_values('timestamp', ascending=False).head(10))
-    else:
-        st.info("No decisions logged yet. Run the simulation to generate data.")
-
-# --- Page: Anomaly Detection ---
-elif st.session_state['page'] == "Anomaly Detection":
-    st.title("Proactive Anomaly Detection in Decision Streams")
-
-    st.markdown(f"Alex's primary role is to proactively identify and mitigate risks. Manual review of every decision is impossible. He needs an automated system to constantly monitor the decision streams and alert him when model behavior deviates from established norms. This is where anomaly detection algorithms come into play, providing the 'smoke detectors' for AI model risk.")
-    st.markdown(f"He will implement four essential anomaly checks. For each check, a **threshold** is defined. If the deviation exceeds this threshold, an alert is logged with a severity level. This aligns with SR 11-7's requirement for ongoing monitoring and proactive risk mitigation.")
-    st.markdown(f"**Concept:** Anomaly Detection Algorithms with Statistical Thresholds")
-
-    st.subheader("Anomaly Detection Parameters")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.session_state['ad_window_days'] = st.number_input(
-            "Recent Window Days",
-            min_value=1, value=st.session_state['ad_window_days'], step=1,
-            help="Number of recent days to compare against baseline."
-        )
-    with col2:
-        st.session_state['ad_baseline_days'] = st.number_input(
-            "Baseline Window Days",
-            min_value=1, value=st.session_state['ad_baseline_days'], step=1,
-            help="Number of historical days for baseline (excluding recent window)."
+        callout(
+            "Why audit logs exist (in one line)",
+            "Because outcomes are not enough — you must be able to reconstruct *how* and *why* a decision happened, later, under scrutiny.",
+            "info",
         )
 
-    st.subheader("Anomaly Checks & Formulas")
+        st.markdown("### What you’ll learn in this lab")
+        st.markdown(
+            """
+- What must be captured in a decision audit log (and what question each field answers)  
+- How monitoring checks become **alerts** written into the same log (evidence trail)  
+- How a Risk Officer triages: “What changed?”, “How severe?”, “What requires review?”  
+- How to produce a committee-ready report (evidence + sign-off)
+            """.strip()
+        )
 
-    st.markdown(f"**1. Decision Distribution Shift:**")
-    st.markdown(f"This check compares the distribution of `prediction` categories in the recent `window_days` against a `baseline_days` period.")
-    st.markdown(r"$$ \Delta P_d = |P_{\text{recent}}(d) - P_{\text{baseline}}(d)| $$")
-    st.markdown(r"where $P_{\text{recent}}(d)$ is the proportion of decision category $d$ in the recent window, and $P_{\text{baseline}}(d)$ is the proportion in the baseline window.")
-    st.markdown(f"An alert is triggered if $\Delta P_d > 0.20$ (20 percentage points) for any decision category $d$.")
+        st.markdown("### The audit log: what you must capture (and why it matters)")
+        st.markdown(
+            """
+**Inputs (reconstruction)** — What did the model *see*?  
+**Outputs (impact)** — What decision did it *make*, and with what certainty?  
+**Context (accountability)** — For whom / which portfolio / which model version?  
+**Governance (control evidence)** — Was it flagged, reviewed, and documented?
+            """.strip()
+        )
 
-    st.markdown(f"**2. Concentration Risk:**")
-    st.markdown(f"This identifies if the model is disproportionately focusing on a single entity (`ticker` for trading signals, not applicable for credit applications in this demo).")
-    st.markdown(f"For the recent window, calculate the maximum proportion of decisions attributed to any single entity:")
-    st.markdown(r"$$ \text{Max Concentration} = \max_{\text{entity}} \left( \frac{\text{Count of decisions for entity}}{\text{Total decisions in recent window}} \right) $$")
-    st.markdown(r"where 'entity' refers to a unique `ticker` for trading signals (e.g., AAPL, MSFT).")
-    st.markdown(f"An alert is triggered if $\text{Max Concentration} > 0.30$ (30%).")
+        st.markdown("#### Field → investigative question mapping")
+        st.markdown(
+            """
+- **timestamp** → *When did the decision occur? Was it during an incident window?*  
+- **model_name + model_version** → *Which model produced it? Did version change?*  
+- **input_hash + input_features** → *Can we reproduce the same input state?*  
+- **prediction + decision_type** → *What action did the model recommend?*  
+- **confidence** → *Did the model’s certainty shift materially?*  
+- **explanation** → *What rationale was recorded for audit/committee review?*  
+- **anomaly_flag + review_status + review_notes** → *Was it flagged? Was it reviewed? What was concluded?*
+            """.strip()
+        )
 
-    st.markdown(f"**3. Confidence Anomaly:**")
-    st.markdown(f"This monitors shifts in the model's average prediction confidence.")
-    st.markdown(r"$$ \Delta \text{Confidence} = |\text{mean Confidence}_{\text{recent}} - \text{mean Confidence}_{\text{baseline}}| $$")
-    st.markdown(r"where $\text{mean Confidence}_{\text{recent}}$ is the average confidence in the recent window, and $\text{mean Confidence}_{\text{baseline}}$ is the average confidence in the baseline.")
-    st.markdown(f"An alert is triggered if $\Delta \text{Confidence} > 0.10$.")
+        st.markdown("### Micro-example (finance-native)")
+        st.markdown(
+            """
+“On Feb 7, the trading model shifted from 10% SELL to 55% SELL.  
+Without an audit log (inputs + model version + context), you cannot prove whether this was regime change, a silent model update, or a data/policy break.”
+            """.strip()
+        )
 
-    st.markdown(f"**4. Volume Anomaly:**")
-    st.markdown(f"This check detects abnormal daily decision counts.")
-    st.markdown(f"Let $\text{Daily Count}_{\text{recent}}$ be the average daily decisions in the recent window, and $\text{Daily Count}_{\text{baseline}}$ be the average daily decisions in the baseline.")
-    st.markdown(r"$$ \text{Daily Count}_{\text{recent}} > 2 \times \text{Daily Count}_{\text{baseline}} $$")
-    st.markdown(f"(more than double) or")
-    st.markdown(r"$$ \text{Daily Count}_{\text{recent}} < 0.3 \times \text{Daily Count}_{\text{baseline}} $$")
-    st.markdown(f"(less than 30% of baseline).")
+    with colB:
+        st.markdown("### Controls")
+        st.button("Reset demo (clear audit log)", on_click=reset_demo)
 
-    st.markdown(f"---")
-    st.subheader("Run Anomaly Detection")
-    run_ad_button = st.button("Run Anomaly Detection for All Models")
-    if run_ad_button:
-        st.session_state['current_alerts_df'] = pd.DataFrame() # Clear previous alerts view
-        with st.spinner("Running anomaly detection checks..."):
-            all_detected_alerts = []
-            for model in st.session_state['models_to_monitor']:
-                # Invokes: detect_decision_anomalies
-                alerts = detect_decision_anomalies(
-                    st.session_state.logger,
-                    model,
-                    window_days=st.session_state['ad_window_days'],
-                    baseline_days=st.session_state['ad_baseline_days']
-                )
-                all_detected_alerts.extend(alerts)
-        if all_detected_alerts:
-            st.success(f"Anomaly detection complete! {len(all_detected_alerts)} new alerts detected and logged.")
+        st.markdown("### What good looks like (targets)")
+        st.markdown(
+            """
+These are **learning targets** to anchor interpretation (not universal standards):
+
+- **Unacknowledged HIGH alerts:** 0  
+- **Pending reviews:** low and bounded by policy capacity  
+- **Logging completeness (coverage):** high enough to reconstruct decisions
+            """.strip()
+        )
+
+        decisions_df = get_decisions_df()
+        cov = compute_logging_coverage(decisions_df)
+        if cov.empty:
+            st.caption("Logging coverage will appear after you generate decisions.")
         else:
-            st.info("No new anomalies detected.")
+            st.markdown("#### Logging completeness (coverage)")
+            st.dataframe(
+                cov.assign(Coverage=cov["Coverage"].map(pct)),
+                use_container_width=True,
+                hide_index=True,
+            )
+            low_cov = cov[cov["Coverage"] < 0.95]
+            if not low_cov.empty:
+                st.warning(
+                    "Some key fields have <95% coverage. In a real governance setting, incomplete logging weakens audit defensibility."
+                )
 
-    st.subheader("Recent Alerts")
-    # Invokes: AIDecisionLogger.get_alerts
-    st.session_state['current_alerts_df'] = st.session_state.logger.get_alerts(
-        days=st.session_state['total_simulation_days'] + st.session_state['ad_baseline_days'] # Ensure all simulated days are covered
+        with st.expander("How are decisions captured without changing the model? (concept-only)", expanded=False):
+            st.markdown(
+                """
+In practice, firms often use a **logging wrapper** around model execution so that every decision emits:
+- the input snapshot (or a hash + reference),
+- the output + confidence,
+- and governance metadata.
+
+This keeps the **governance evidence** consistent even as models evolve.
+                """.strip()
+            )
+
+# =============================================================================
+# PAGE 2: SIMULATION & DATA GENERATION
+# =============================================================================
+elif st.session_state["page"] == "Simulation & Data Generation":
+    st.header("Generate a Decision Stream (and Stress-Test Monitoring Rules)")
+
+    callout(
+        "What you’re doing here",
+        "You will generate a production-like stream of decisions, then inject a controlled anomaly to test whether monitoring rules detect it.",
+        "info",
     )
 
-    if not st.session_state['current_alerts_df'].empty:
-        # Display alerts and allow acknowledgment
-        st.dataframe(st.session_state['current_alerts_df'].sort_values('timestamp', ascending=False))
+    st.markdown("### Simulation controls (chosen to make the anomaly visible)")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.session_state.total_simulation_days = st.number_input("Horizon (days)", min_value=3, max_value=30, value=int(st.session_state.total_simulation_days))
+    with c2:
+        st.session_state.anomaly_trigger_day = st.number_input(
+            "Inject anomaly on day # (1…Horizon)",
+            min_value=1,
+            max_value=int(st.session_state.total_simulation_days),
+            value=int(st.session_state.anomaly_trigger_day),
+            help="This is the day where we deliberately change behavior (e.g., SELL skew or looser credit approvals).",
+        )
+    with c3:
+        st.session_state.n_trading_decisions_per_day = st.number_input("Trading signals per day (count)", min_value=10, max_value=500, value=int(st.session_state.n_trading_decisions_per_day))
+    with c4:
+        st.session_state.n_credit_decisions_per_day = st.number_input("Credit decisions per day (count)", min_value=10, max_value=1000, value=int(st.session_state.n_credit_decisions_per_day))
 
-        st.markdown(f"**Review and Acknowledge Alerts**")
-        col_alert_id, col_ack_button = st.columns([1, 1])
-        alert_to_ack = col_alert_id.number_input("Enter Alert ID to Acknowledge",
-                                                  min_value=st.session_state['current_alerts_df']['id'].min(),
-                                                  max_value=st.session_state['current_alerts_df']['id'].max(),
-                                                  value=st.session_state['current_alerts_df']['id'].min(),
-                                                  step=1, key='alert_id_input')
-        if col_ack_button.button("Acknowledge Selected Alert"):
-            if alert_to_ack in st.session_state['current_alerts_df']['id'].values:
-                # Invokes: acknowledge_alert
-                acknowledge_alert(alert_to_ack)
-                st.rerun() # Rerun to refresh the displayed alerts
-            else:
-                st.warning(f"Alert ID {alert_to_ack} not found in the current list.")
+    assumptions_box([
+        "Each row in the audit log is one decision event (one trade signal OR one credit application decision).",
+        "The anomaly is intentional and designed to mimic real-world breakpoints (data feed issues, policy overrides, silent model changes).",
+    ])
+
+    st.markdown("### What anomaly gets injected?")
+    st.markdown(
+        """
+- **Trading model:** a sudden distribution shift toward **SELL** decisions (behavioral regime shift)  
+- **Credit model:** a shift toward more approvals by lowering the average FICO score (policy-like shift)
+        """.strip()
+    )
+
+    checkpoint_question(
+        "If you inject an anomaly on Day 4 of a 6‑day horizon, what is the governance purpose?",
+        ["To maximize model accuracy", "To test whether monitoring detects a controlled behavioral break", "To train the model"],
+        "To test whether monitoring detects a controlled behavioral break",
+        "In governance, simulations with injected anomalies are used to validate *controls* (detection + workflow), not to improve predictive power.",
+    )
+
+    st.divider()
+    if st.button("Generate decisions and write to audit log", type="primary"):
+        try:
+            total_days = int(st.session_state.total_simulation_days)
+            anomaly_day = int(st.session_state.anomaly_trigger_day)
+            for day in range(1, total_days + 1):
+                simulate_production_day(
+                    logger_instance=st.session_state.logger,
+                    n_trading=int(st.session_state.n_trading_decisions_per_day),
+                    n_credit=int(st.session_state.n_credit_decisions_per_day),
+                    anomaly_day=(day == anomaly_day),
+                )
+            invalidate_caches()
+            st.success("Decisions generated and logged.")
+        except Exception as e:
+            st.error(f"Simulation failed: {e}")
+
+    decisions_df = get_decisions_df()
+    st.markdown("### Simulated Decisions Overview (audit log preview)")
+    st.caption("Each row = one logged decision event. Your goal is to ensure decisions are reconstructable and reviewable.")
+    if decisions_df.empty:
+        st.info("No decisions yet. Click **Generate decisions and write to audit log**.")
     else:
-        st.info("No alerts found in the database for the specified period. Run a simulation and anomaly detection first.")
+        st.write(f"Total logged decisions: **{len(decisions_df):,}**")
+        st.dataframe(decisions_df.sort_values("timestamp", ascending=False).head(25), use_container_width=True)
 
-# --- Page: Risk Officer Dashboard ---
-elif st.session_state['page'] == "Risk Officer Dashboard":
-    st.title("The Risk Officer's Monitoring Dashboard")
+        st.markdown("#### Logging completeness (coverage)")
+        cov = compute_logging_coverage(decisions_df)
+        st.dataframe(cov.assign(Coverage=cov["Coverage"].map(pct)), use_container_width=True, hide_index=True)
 
-    st.markdown(f"With a continuous stream of decisions and potential alerts, Alex needs a consolidated 'Risk Officer Review Dashboard.' This dashboard must provide a high-level overview of AI model activity, highlight detected anomalies, show decision distributions, and identify any concentration risks. This unified view enables Alex to quickly grasp the current state of FinSecure's AI models, prioritize his review tasks, and respond promptly to critical issues, fulfilling the 'ongoing monitoring' aspect of SR 11-7.")
-    st.markdown(f"**Concept:** Data Aggregation and Visualization for Insights")
+        evidence_box([
+            "Coverage % for required fields (inputs, outputs, model version, user/portfolio context)",
+            "Any missing-field exceptions and their resolution",
+            "Retention policy and access control statement (conceptually)",
+        ])
 
-    st.sidebar.subheader("Dashboard Controls")
-    
-    # Get index for selectbox
-    try:
-        model_index = st.session_state['models_to_monitor'].index(st.session_state['selected_dashboard_model'])
-    except:
-        model_index = 0
-        
-    st.session_state['selected_dashboard_model'] = st.sidebar.selectbox(
-        "Select Model",
-        st.session_state['models_to_monitor'],
-        index=model_index
-    )
-    st.session_state['dashboard_review_period'] = st.sidebar.slider(
-        "Review Period (days)",
-        min_value=1, max_value=st.session_state['total_simulation_days'],
-        value=min(st.session_state['dashboard_review_period'], st.session_state['total_simulation_days']), step=1
+# =============================================================================
+# PAGE 3: ANOMALY DETECTION
+# =============================================================================
+elif st.session_state["page"] == "Anomaly Detection":
+    st.header("Monitoring Rules (Transparent, Auditable Checks)")
+
+    callout(
+        "Key idea",
+        "These checks are *smoke detectors*. A triggered alert is a triage signal — not proof of model failure.",
+        "info",
     )
 
-    model_name = st.session_state['selected_dashboard_model']
-    days = st.session_state['dashboard_review_period']
+    st.markdown("### Choose monitoring windows")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.session_state.recent_window_days = st.slider("Recent window (days)", min_value=1, max_value=7, value=int(st.session_state.recent_window_days))
+    with c2:
+        st.session_state.baseline_window_days = st.slider("Baseline window (days)", min_value=2, max_value=30, value=int(st.session_state.baseline_window_days))
 
-    # Invokes: AIDecisionLogger.get_decisions, AIDecisionLogger.get_alerts
-    decisions_df = st.session_state.logger.get_decisions(model_name, days=days, limit=10000)
-    alerts_df = st.session_state.logger.get_alerts(model_name, days=days)
+    assumptions_box([
+        "Baseline window is intended to represent 'normal' behavior.",
+        "Recent window is the period you want to test for sudden behavior change.",
+        "Thresholds below are demo values; in practice they reflect risk appetite + expected variability.",
+    ])
 
-    st.subheader(f"Dashboard for: {model_name} (Last {days} days)")
+    st.markdown("### Checks and formulas (do not treat as black boxes)")
+    # IMPORTANT: Keep all formulae markdown lines from the original app (do not remove).
+    st.markdown("#### 1) Distribution shift (Trading + Credit)")
+    st.markdown(r"""
+$$
+\Delta P_d = |P_{\text{recent}}(d) - P_{\text{baseline}}(d)|
+$$""")
+    st.markdown(f"An alert is triggered if $\\Delta P_d > 0.20$ (20 percentage points) for any decision category $d$.")
+
+    st.markdown("#### 2) Concentration risk (Trading only)")
+    st.markdown(r"""
+$$
+\text{Max Concentration} = \max_{\text{entity}} \left( \frac{\text{Count of decisions for entity}}{\text{Total decisions in recent window}} \right)
+$$""")
+    st.markdown("An alert is triggered if Max Concentration > 0.30 (30%).")
+
+    st.markdown("#### 3) Confidence shift (Trading + Credit)")
+    st.markdown(r"""
+$$
+\Delta \text{Confidence} = |\text{mean Confidence}_{\text{recent}} - \text{mean Confidence}_{\text{baseline}}|
+$$""")
+    st.markdown(r"An alert is triggered if $\Delta \text{Confidence} > 0.10$.")
+
+    st.markdown("#### 4) Volume anomaly (Trading + Credit)")
+    st.markdown(r"""
+$$
+\text{Daily Count}_{\text{recent}} > 2 \times \text{Daily Count}_{\text{baseline}}
+$$""")
+    st.markdown(r"""
+$$
+\text{Daily Count}_{\text{recent}} < 0.3 \times \text{Daily Count}_{\text{baseline}}
+$$""")
+    st.markdown("An alert is triggered if either condition is met.")
+
+    st.divider()
+
+    st.markdown("### Risk appetite intuition (how to think about thresholds)")
+    st.markdown(
+        """
+- **Tighter thresholds** → faster detection, more false alarms (more investigation workload)  
+- **Looser thresholds** → fewer false alarms, slower detection (risk can accumulate unnoticed)
+        """.strip()
+    )
+
+    checkpoint_question(
+        "If SELL share rises from 15% to 40%, does it breach the distribution shift threshold (20pp)?",
+        ["Yes", "No", "Not enough information"],
+        "Yes",
+        "ΔP = |0.40 − 0.15| = 0.25 (25 percentage points) which is > 0.20, so it triggers.",
+    )
+
+    st.divider()
+
+    decisions_df = get_decisions_df()
+    models = sorted(decisions_df["model_name"].dropna().unique().tolist()) if not decisions_df.empty and "model_name" in decisions_df.columns else []
+
+    if st.button("Run checks and write alerts to the audit log", type="primary"):
+        try:
+            if not models:
+                st.warning("No model names found yet. Generate decisions first.")
+            else:
+                for m in models:
+                    detect_decision_anomalies(
+                        logger_instance=st.session_state.logger,
+                        model_name=m,
+                        window_days=int(st.session_state.recent_window_days),
+                        baseline_days=int(st.session_state.baseline_window_days),
+                    )
+                invalidate_caches()
+                st.success("Anomaly checks completed and alerts (if any) were written to the log.")
+        except Exception as e:
+            st.error(f"Anomaly detection failed: {e}")
+
+    alerts_df = get_alerts_df()
+    st.markdown("### Alerts written to the audit log (what needs triage)")
+    st.caption("An alert is a triage ticket: investigate, document, and close the loop.")
+    if alerts_df.empty:
+        st.info("No alerts recorded yet. Generate decisions, then run anomaly checks.")
+    else:
+        alerts_df["timestamp"] = pd.to_datetime(alerts_df["timestamp"], errors="coerce")
+        st.dataframe(alerts_df.sort_values("timestamp", ascending=False), use_container_width=True)
+
+        unack_df = alerts_df[alerts_df.get("acknowledged", 0) == 0]
+        high_unack = unack_df[unack_df.get("severity", "").astype(str).str.upper() == "HIGH"]
+        if not high_unack.empty:
+            st.warning("There are **unacknowledged HIGH** alerts. In governance terms, detection exists but response ownership is missing.")
+
+        st.markdown("#### Triage ownership (acknowledge an alert)")
+        a1, a2, a3 = st.columns([1, 2, 2])
+        with a1:
+            alert_id = st.number_input("Alert ID", min_value=1, value=int(alerts_df["id"].max()))
+        with a2:
+            acknowledged_by = st.text_input("Acknowledged by (name/role)", value="Alex Chen (Risk Officer)")
+        with a3:
+            if st.button("Acknowledge selected alert"):
+                acknowledge_alert(int(alert_id), acknowledged_by)
+
+        evidence_box([
+            "Alert SLA policy (how quickly HIGH/MEDIUM must be triaged)",
+            "Standard triage notes template: hypothesis → evidence checked → conclusion → actions",
+            "Link from alerts to impacted decisions and versions",
+        ])
+
+# =============================================================================
+# PAGE 4: RISK OFFICER DASHBOARD
+# =============================================================================
+elif st.session_state["page"] == "Risk Officer Dashboard":
+    st.header("Risk Officer Dashboard: Daily Triage Snapshot → Investigation → Documentation")
+
+    decisions_df = get_decisions_df()
+    alerts_df = get_alerts_df()
 
     if decisions_df.empty:
-        st.warning(f"No decisions recorded for {model_name} in the last {days} days. Please run the simulation first.")
+        st.info("No decisions available yet. Generate decisions in **Simulation & Data Generation**.")
+        st.stop()
+
+    decisions_df["timestamp"] = pd.to_datetime(decisions_df["timestamp"], errors="coerce")
+
+    # Sidebar controls
+    st.sidebar.divider()
+    st.sidebar.subheader("Dashboard Controls")
+    model_names = sorted(decisions_df["model_name"].dropna().unique().tolist()) if "model_name" in decisions_df.columns else []
+    if not model_names:
+        model_names = ["MomentumSignal", "CreditScorer"]
+
+    # If not set, default to first model
+    if st.session_state.selected_dashboard_model is None:
+        st.session_state.selected_dashboard_model = model_names[0]
+
+    st.session_state.selected_dashboard_model = st.sidebar.selectbox(
+        "Model",
+        model_names,
+        index=model_names.index(st.session_state.selected_dashboard_model) if st.session_state.selected_dashboard_model in model_names else 0,
+    )
+    st.session_state.dashboard_review_period = st.sidebar.slider("Lookback window (days)", min_value=3, max_value=30, value=int(st.session_state.dashboard_review_period))
+
+    model = st.session_state.selected_dashboard_model
+    lookback_days = int(st.session_state.dashboard_review_period)
+
+    end_ts = decisions_df["timestamp"].max()
+    start_ts = end_ts - timedelta(days=lookback_days)
+    ddf = decisions_df[(decisions_df["timestamp"] >= start_ts) & (decisions_df["model_name"] == model)].copy()
+
+    if ddf.empty:
+        st.warning("No decisions in the selected lookback window for this model.")
+        st.stop()
+
+    # Summary stats
+    st.markdown("### Daily Triage Snapshot")
+    total = len(ddf)
+    pending = (ddf.get("review_status", "").astype(str).str.lower() == "pending").sum() if "review_status" in ddf.columns else 0
+    flagged = (ddf.get("anomaly_flag", 0) == 1).sum() if "anomaly_flag" in ddf.columns else 0
+
+    # Alerts slice for this model + window
+    if not alerts_df.empty and "timestamp" in alerts_df.columns:
+        alerts_df["timestamp"] = pd.to_datetime(alerts_df["timestamp"], errors="coerce")
+        adf = alerts_df[(alerts_df["timestamp"] >= start_ts) & (alerts_df.get("model_name", "") == model)].copy()
     else:
-        # --- Summary Statistics ---
-        st.markdown(f"---")
-        st.subheader("Summary Statistics")
-        col1, col2, col3, col4, col5, col6 = st.columns(6)
-        total_decisions = len(decisions_df)
-        decisions_per_day = total_decisions / max(1, days)
-        pending_reviews = len(decisions_df[decisions_df['review_status'] == 'pending'])
-        flagged_decisions = len(decisions_df[decisions_df['anomaly_flag'] == 1]) # From initial simulation marking
-        total_alerts = len(alerts_df)
-        high_severity_alerts = len(alerts_df[alerts_df['severity'] == 'HIGH'])
-        unacknowledged_alerts = len(alerts_df[alerts_df['acknowledged'] == 0])
+        adf = pd.DataFrame()
 
+    unack = (adf.get("acknowledged", 0) == 0).sum() if not adf.empty else 0
 
-        col1.metric("Total Decisions", total_decisions)
-        col2.metric("Decisions/Day (Avg)", f"{decisions_per_day:.0f}")
-        col3.metric("Pending Reviews", pending_reviews)
-        col4.metric("Flagged Decisions", flagged_decisions)
-        col5.metric("Total Alerts", total_alerts)
-        col6.metric("Unacknowledged Alerts", unacknowledged_alerts)
+    days_span = max(1, ddf["timestamp"].dt.normalize().nunique())
+    avg_per_day = total / days_span
 
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Decisions logged (period)", f"{total:,}")
+    m2.metric("Throughput (avg/day)", f"{avg_per_day:,.1f}")
+    m3.metric("Decisions awaiting human sign-off", f"{pending:,}")
+    m4.metric("Alerts not yet triaged", f"{unack:,}")
 
-        # --- Visualizations ---
-        st.markdown(f"---")
-        st.subheader("Decision Distribution Over Time")
-        decisions_df['date'] = decisions_df['timestamp'].dt.normalize()
-        daily_dist = decisions_df.groupby(['date', 'prediction']).size().unstack(fill_value=0)
-        daily_dist_pct = daily_dist.div(daily_dist.sum(axis=1), axis=0) # Convert to proportions
+    # Governance guardrails
+    if unack > 0:
+        st.warning("Guardrail: unacknowledged alerts indicate a governance backlog. Detection without response is an ineffective control.")
+    if pending > 0 and pending / total > 0.25:
+        st.warning("Guardrail: a high pending-review ratio suggests monitoring capacity is insufficient relative to throughput.")
 
-        fig_dist_time = px.bar(
-            daily_dist_pct,
-            x=daily_dist_pct.index,
-            y=daily_dist_pct.columns,
-            title='Daily Decision Distribution (%)',
-            labels={'x': 'Date', 'value': 'Proportion', 'variable': 'Decision'}, # 'variable' is default for unstacked columns
-            color_discrete_sequence=px.colors.qualitative.Vivid,
-            height=450
+    st.divider()
+
+    # Chart: Decision distribution over time
+    st.markdown("### Did the model change its behavior?")
+    if "prediction" in ddf.columns:
+        daily = (
+            ddf.assign(day=ddf["timestamp"].dt.date)
+               .groupby(["day", "prediction"])
+               .size()
+               .reset_index(name="count")
         )
-        fig_dist_time.update_layout(yaxis_tickformat=".0%")
-        # Highlight anomaly days if distribution shift alerts are present
-        for _, alert_row in alerts_df[alerts_df['alert_type'] == 'distribution_shift'].iterrows():
-            alert_date = pd.to_datetime(alert_row['timestamp']).normalize()
-            if alert_date in daily_dist_pct.index:
-                fig_dist_time.add_vline(x=alert_date.timestamp() * 1000, line_width=2, line_dash="dash", line_color="red", annotation_text="Shift Alert", annotation_position="top right")
-        st.plotly_chart(fig_dist_time, use_container_width=True)
+        daily_tot = daily.groupby("day")["count"].transform("sum")
+        daily["pct"] = daily["count"] / daily_tot
 
+        fig = px.bar(daily, x="day", y="pct", color="prediction", title="Daily Decision Distribution (%)")
+        fig.update_yaxes(tickformat=".0%")
+        st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown(f"---")
-        st.subheader("Confidence Distribution")
-        if 'confidence' in decisions_df.columns:
-            clean_confidence = pd.to_numeric(decisions_df['confidence'], errors='coerce').dropna()
-            if not clean_confidence.empty:
-                fig_conf = px.histogram(
-                    clean_confidence,
-                    nbins=20,
-                    title='Distribution of Prediction Confidence Scores',
-                    labels={'value': 'Confidence Score', 'count': 'Frequency'},
-                    color_discrete_sequence=px.colors.qualitative.Pastel,
-                    height=450
-                )
-                # Optionally highlight confidence anomalies
-                for _, alert_row in alerts_df[alerts_df['alert_type'] == 'confidence_shift'].iterrows():
-                    fig_conf.add_annotation(
-                        x=clean_confidence.mean(), y=fig_conf.layout.yaxis.range[1]*0.9 if fig_conf.layout.yaxis.range else 10,
-                        text=f"Confidence Shift Alert", showarrow=True, arrowhead=1,
-                        font=dict(color="red"), bgcolor="rgba(255,0,0,0.1)"
-                    )
-                st.plotly_chart(fig_conf, use_container_width=True)
-            else:
-                st.info("No valid confidence data available for this model in the selected period.")
+        st.caption("Decision translation: if a category (e.g., SELL or APPROVE) rises sharply, investigate whether this reflects a market regime shift, a model/version change, or a data/policy break.")
+    else:
+        st.info("No prediction field available to plot distribution.")
+
+    # Confidence distribution
+    st.markdown("### Did certainty change (possible drift or regime shift)?")
+    if "confidence" in ddf.columns:
+        fig2 = px.histogram(ddf, x="confidence", nbins=20, title="Distribution of Prediction Confidence Scores")
+        st.plotly_chart(fig2, use_container_width=True)
+
+        recent_cut = end_ts - timedelta(days=min(2, lookback_days))
+        recent_mean = pd.to_numeric(ddf[ddf["timestamp"] >= recent_cut]["confidence"], errors="coerce").dropna().mean()
+        base_mean = pd.to_numeric(ddf[ddf["timestamp"] < recent_cut]["confidence"], errors="coerce").dropna().mean()
+        st.caption(f"Recent mean confidence: **{recent_mean:.3f}** • Baseline mean confidence: **{base_mean:.3f}**")
+        st.caption("Decision translation: if confidence collapses, tighten risk buffers (smaller positions / higher review sampling / tighter credit cutoffs) until you confirm cause.")
+    else:
+        st.info("No confidence field available to plot.")
+
+    # Concentration risk (ticker-based; trading-like)
+    if "ticker" in ddf.columns and ddf["ticker"].notna().any():
+        st.markdown("### Is the model over-focusing on a few names?")
+        recent_window = ddf[ddf["timestamp"] >= (end_ts - timedelta(days=min(2, lookback_days)))].copy()
+        if not recent_window.empty:
+            top = recent_window["ticker"].value_counts(normalize=True).head(10).reset_index()
+            top.columns = ["ticker", "share"]
+            fig3 = px.bar(top, x="ticker", y="share", title="Top Tickers by Share of Decisions (Recent Window)")
+            fig3.add_hline(y=0.30, line_dash="dash")
+            fig3.update_yaxes(tickformat=".0%")
+            st.plotly_chart(fig3, use_container_width=True)
+            st.caption("Decision translation: if concentration rises, apply portfolio constraints or require human approval for repeated same-name actions.")
+            st.caption("Watch-out: decision concentration is not the same as exposure concentration—confirm with portfolio weights.")
         else:
-            st.info("No 'confidence' column available for this model.")
+            st.info("Not enough recent data to compute concentration.")
+    else:
+        st.caption("Concentration risk chart applies to trading-like models (requires an entity field such as ticker).")
 
-        st.markdown(f"---")
-        st.subheader("Concentration Risk")
-        # Concentration risk only applies meaningfully to trading signals (tickers) for this demo
-        if 'ticker' in decisions_df.columns and model_name == 'MomentumSignal':
-            ticker_counts = decisions_df['ticker'].value_counts(normalize=True).head(10) # Top 10 tickers
-            if not ticker_counts.empty:
-                fig_concentration = px.bar(
-                    ticker_counts,
-                    x=ticker_counts.values,
-                    y=ticker_counts.index,
-                    orientation='h',
-                    title=f'Top Ticker Concentration for {model_name} (%)',
-                    labels={'x': 'Proportion of Decisions', 'y': 'Ticker'},
-                    color_discrete_sequence=px.colors.qualitative.D3,
-                    height=450
-                )
-                fig_concentration.update_layout(xaxis_tickformat=".0%")
-                # Highlight if max concentration alert exists
-                if not alerts_df[alerts_df['alert_type'] == 'concentration_risk'].empty:
-                    fig_concentration.add_vline(x=0.30, line_width=2, line_dash="dot", line_color="red", annotation_text="Concentration Threshold (30%)", annotation_position="bottom right")
-                st.plotly_chart(fig_concentration, use_container_width=True)
-            else:
-                st.info("No ticker data available for this model in the selected period.")
-        else:
-            st.info("Concentration risk analysis not applicable or no ticker data for this model.")
+    # Alert timeline
+    st.markdown("### When did monitoring rules fire, and how severe?")
+    if not adf.empty:
+        fig4 = px.scatter(adf, x="timestamp", y="severity", color="severity", title="Alert Timeline by Severity")
+        st.plotly_chart(fig4, use_container_width=True)
+        st.caption("Decision translation: clusters of HIGH alerts warrant escalation (incident response mindset): verify data feeds, freeze changes, increase manual sampling.")
+    else:
+        st.info("No alerts in the selected window for this model.")
 
-        st.markdown(f"---")
-        st.subheader("Alert Timeline")
-        if not alerts_df.empty:
-            severity_map = {'LOW': 'green', 'MEDIUM': 'orange', 'HIGH': 'red'}
-            # Create a severity_order column for consistent Y-axis ordering
-            alerts_df['severity_order'] = alerts_df['severity'].map({'LOW': 1, 'MEDIUM': 2, 'HIGH': 3})
+    st.divider()
 
-            fig_alerts = px.scatter(
-                alerts_df.sort_values('severity_order'), # Sort to ensure higher severity is on top if points overlap
-                x='timestamp',
-                y='severity', # Plot actual severity text on Y-axis
-                color='severity',
-                title='Alert Timeline by Severity',
-                labels={'timestamp': 'Time', 'severity': 'Severity Level'},
-                color_discrete_map=severity_map,
-                height=450
+    # Flagged decisions
+    st.markdown("### Decisions marked for review (anomaly flag) — human sign-off workflow")
+    st.caption("Workflow: open a flagged decision → verify inputs → compare to baseline → document conclusion → mark reviewed.")
+
+    if "anomaly_flag" in ddf.columns and (ddf["anomaly_flag"] == 1).any():
+        flagged_df = ddf[ddf["anomaly_flag"] == 1].sort_values("timestamp", ascending=False).copy()
+        st.dataframe(flagged_df.head(50), use_container_width=True)
+
+        with st.expander("Common misconceptions & watch-outs", expanded=False):
+            st.markdown(
+                """
+- A flagged decision is **not** automatically incorrect; it is a **triage signal**.
+- A legitimate regime change can trigger alerts; governance requires documentation, not denial.
+- A “reviewed” label without rationale is not defensible under audit.
+                """.strip()
             )
-            # Ensure Y-axis displays severity levels in a specific order
-            fig_alerts.update_layout(yaxis=dict(categoryorder='array', categoryarray=['LOW', 'MEDIUM', 'HIGH']))
-            fig_alerts.update_traces(marker=dict(size=10, line=dict(width=1, color='DarkSlateGrey')))
-            st.plotly_chart(fig_alerts, use_container_width=True)
-        else:
-            st.info("No alerts in this period for this model.")
+    else:
+        st.info("No decisions are flagged for review in this window.")
 
-        st.markdown(f"---")
-        st.subheader("Flagged Decisions for Review")
-        st.markdown(f"Alex needs to review decisions that have been flagged due to anomalous behavior or are otherwise pending review.")
+# =============================================================================
+# PAGE 5: AUDIT REPORT
+# =============================================================================
+elif st.session_state["page"] == "Audit Report":
+    st.header("Weekly/Monthly AI Governance Report (Evidence + Sign-Off)")
 
-        review_status_filter = st.selectbox(
-            "Filter Decisions by Review Status",
-            ['All', 'pending', 'reviewed', 'acknowledged'],
-            key='dashboard_review_filter'
-        )
+    decisions_df = get_decisions_df()
+    alerts_df = get_alerts_df()
 
-        filtered_decisions_df = decisions_df.copy()
-        if review_status_filter != 'All':
-            filtered_decisions_df = filtered_decisions_df[filtered_decisions_df['review_status'] == review_status_filter]
-
-        if not filtered_decisions_df.empty:
-            st.dataframe(filtered_decisions_df.sort_values('timestamp', ascending=False))
-
-            st.markdown(f"**Update Review Status for a Decision**")
-            col_dec_id, col_new_status = st.columns(2)
-            decision_id_to_update = col_dec_id.number_input("Decision ID",
-                                                              min_value=filtered_decisions_df['id'].min(),
-                                                              max_value=filtered_decisions_df['id'].max(),
-                                                              value=filtered_decisions_df['id'].iloc[0] if not filtered_decisions_df.empty else 1,
-                                                              step=1, key='dashboard_decision_id_input')
-            new_review_status = col_new_status.selectbox("New Status", ['pending', 'reviewed', 'acknowledged'], key='dashboard_new_status_select')
-            review_notes = st.text_area("Review Notes", key='dashboard_review_notes_input')
-
-            if st.button("Update Decision Review Status", key='dashboard_update_decision_button'):
-                if decision_id_to_update in decisions_df['id'].values:
-                    # Invokes: update_decision_review_status
-                    update_decision_review_status(decision_id_to_update, new_review_status, review_notes)
-                    st.rerun() # Rerun to refresh the displayed decisions
-                else:
-                    st.warning(f"Decision ID {decision_id_to_update} not found in current view.")
-        else:
-            st.info("No decisions to display for review based on current filters and model activity.")
-
-# --- Page: Audit Report ---
-elif st.session_state['page'] == "Audit Report":
-    st.title("Generating a Periodic AI Model Audit Report")
-
-    st.markdown(f"Beyond daily monitoring, Alex, as a Risk Officer, is responsible for providing formal, periodic compliance reports to FinSecure Bank's risk committee and external regulators. These reports summarize AI model activity, highlight detected anomalies, detail review statuses, and affirm compliance with relevant regulations like SR 11-7 and the EU AI Act. This formal documentation is essential for demonstrating robust AI governance and accountability.")
-    st.markdown(f"**Concept:** Structured Reporting for Compliance")
-
+    st.sidebar.divider()
     st.sidebar.subheader("Report Controls")
-    st.session_state['audit_report_period'] = st.sidebar.slider(
-        "Report Period (days)",
-        min_value=1, max_value=st.session_state['total_simulation_days'],
-        value=min(st.session_state['audit_report_period'], st.session_state['total_simulation_days']), step=1
+    st.session_state.audit_report_period = st.sidebar.slider("Reporting period (days)", min_value=7, max_value=90, value=int(st.session_state.audit_report_period))
+    period_days = int(st.session_state.audit_report_period)
+
+    if decisions_df.empty:
+        st.info("No decisions available yet. Generate decisions first.")
+        st.stop()
+
+    st.markdown("### What this report is (and is not)")
+    st.markdown(
+        """
+- **Is:** a governance artifact for committee/regulators: evidence of monitoring, triage, and sign-off  
+- **Is not:** a performance report or a claim that the model is “correct”
+        """.strip()
     )
 
-    if st.button("Generate Audit Report"):
-        with st.spinner(f"Generating audit report for the last {st.session_state['audit_report_period']} days..."):
-            # Invokes: generate_audit_report
-            st.session_state['generated_audit_report'] = generate_audit_report(
-                st.session_state.logger,
-                period_days=st.session_state['audit_report_period']
-            )
-        st.success("Audit report generated!")
+    callout(
+        "Guardrail",
+        "A report that shows HIGH alerts with no documented triage or review notes is a governance failure — even if P&L looked fine.",
+        "warning",
+    )
 
-    if st.session_state['generated_audit_report']:
-        report_data = st.session_state['generated_audit_report']
-        st.header(report_data['report_title'])
-        st.markdown(f"**Period**: {report_data['period']}")
-        st.markdown(f"**Generated**: {report_data['generation_date']}")
+    # Generate report text using source.py function (no implementation detail exposed)
+    if st.button("Generate report (committee-ready)", type="primary"):
+        try:
+            report_dict = generate_audit_report(logger_instance=st.session_state.logger, period_days=period_days)
+            st.session_state["last_report_dict"] = report_dict
+            st.success("Report generated.")
+        except Exception as e:
+            st.error(f"Report generation failed: {e}")
 
-        st.markdown(f"### Executive Summary")
-        for key, value in report_data['executive_summary'].items():
-            st.markdown(f"- **{key.replace('_', ' ').title()}**: {value}")
+    report_dict = st.session_state.get("last_report_dict", None)
 
-        st.markdown(f"### Model Summaries")
-        if not report_data['model_summaries']:
-            st.info("No model summaries for the period.")
-        for model, stats in report_data['model_summaries'].items():
-            st.markdown(f"#### Model: {model}")
-            for stat_key, stat_value in stats.items():
-                st.markdown(f"  - **{stat_key.replace('_', ' ').title()}**: {stat_value}")
+    # Executive snapshot for interpretation (simple, evidence-based)
+    decisions_df["timestamp"] = pd.to_datetime(decisions_df["timestamp"], errors="coerce")
+    end_ts = decisions_df["timestamp"].max()
+    start_ts = end_ts - timedelta(days=period_days)
+    period_df = decisions_df[decisions_df["timestamp"] >= start_ts].copy()
 
-        st.markdown(f"### Regulatory Compliance Status")
-        for reg, status in report_data['regulatory_compliance'].items():
-            st.markdown(f"- **{reg.replace('_', ' ').title()}**: {status}")
+    pending = (period_df.get("review_status", "").astype(str).str.lower() == "pending").sum() if "review_status" in period_df.columns else 0
+    flagged = (period_df.get("anomaly_flag", 0) == 1).sum() if "anomaly_flag" in period_df.columns else 0
+    total = len(period_df)
 
-        st.markdown(f"### Sign-Off")
-        for role, details in report_data['sign_off'].items():
-            st.markdown(f"- **{role}**: {details['name']} (Date: {details['date']})")
-            st.markdown(f"  Signature: __________________________")
+    if not alerts_df.empty and "timestamp" in alerts_df.columns:
+        alerts_df["timestamp"] = pd.to_datetime(alerts_df["timestamp"], errors="coerce")
+        period_alerts = alerts_df[alerts_df["timestamp"] >= start_ts].copy()
+        unack = (period_alerts.get("acknowledged", 0) == 0).sum()
+    else:
+        period_alerts = pd.DataFrame()
+        unack = 0
 
-        # Option to download the report as Markdown/Text
-        report_text = ""
-        report_text += f"# {report_data['report_title']}\n"
-        report_text += f"**Period**: {report_data['period']}\n"
-        report_text += f"**Generated**: {report_data['generation_date']}\n\n"
-        report_text += "## Executive Summary\n"
-        for key, value in report_data['executive_summary'].items():
-            report_text += f"- **{key.replace('_', ' ').title()}**: {value}\n"
-        report_text += "\n## Model Summaries\n"
-        if not report_data['model_summaries']:
-            report_text += "No model summaries for the period.\n"
-        for model, stats in report_data['model_summaries'].items():
-            report_text += f"\n### Model: {model}\n"
-            for stat_key, stat_value in stats.items():
-                report_text += f"  - **{stat_key.replace('_', ' ').title()}**: {stat_value}\n"
-        report_text += "\n## Regulatory Compliance Status\n"
-        for reg, status in report_data['regulatory_compliance'].items():
-            report_text += f"- **{reg.replace('_', ' ').title()}**: {status}\n"
-        report_text += "\n## Sign-Off\n"
-        for role, details in report_data['sign_off'].items():
-            report_text += f"- **{role}**: {details['name']} (Date: {details['date']})\n"
-            report_text += "  Signature: __________________________\n\n"
+    st.markdown("### Executive summary (period)")
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Decisions logged", f"{total:,}")
+    a2.metric("Flagged for review", f"{flagged:,}")
+    a3.metric("Pending reviews", f"{pending:,}")
+    a4.metric("Unacknowledged alerts", f"{unack:,}")
 
+    st.markdown("### Evidence: logging completeness (coverage)")
+    cov = compute_logging_coverage(period_df)
+    if cov.empty:
+        st.info("Coverage will appear after decisions are generated.")
+    else:
+        st.dataframe(cov.assign(Coverage=cov["Coverage"].map(pct)), use_container_width=True, hide_index=True)
+
+    evidence_box([
+        "Coverage % for required fields (inputs, outputs, model version, user/portfolio context)",
+        "Alert triage SLA compliance (especially HIGH)",
+        "Review note completeness for flagged decisions",
+        "Retention and access controls statement (conceptual controls)",
+    ])
+
+    st.divider()
+    if report_dict:
+        # Convert dict to formatted text
+        report_lines = []
+        report_lines.append("=" * 80)
+        report_lines.append(f"       {report_dict['report_title']}")
+        report_lines.append(f"       Period: {report_dict['period']}")
+        report_lines.append(f"       Generated: {report_dict['generation_date']}")
+        report_lines.append("=" * 80)
+        report_lines.append("")
+        report_lines.append("--- EXECUTIVE SUMMARY ---")
+        summary = report_dict['executive_summary']
+        report_lines.append(f"Total AI Decisions: {summary['total_ai_decisions']}")
+        report_lines.append(f"Active Models: {summary['models_active']}")
+        report_lines.append(f"Total Alerts: {summary['total_alerts']} (HIGH: {summary['high_severity_alerts']}, Unacknowledged: {summary['unacknowledged_alerts']})")
+        report_lines.append(f"Decisions Pending Review: {summary['decisions_pending_review']}")
+        report_lines.append("")
+        report_lines.append("--- MODEL SUMMARIES ---")
+        if not report_dict['model_summaries']:
+            report_lines.append("No model summaries for the period.")
+        for model, stats in report_dict['model_summaries'].items():
+            report_lines.append(f"\nModel: {model}")
+            report_lines.append(f"  Decisions: {stats['decision_count']}")
+            report_lines.append(f"  Distribution: {stats['decision_distribution']}")
+            report_lines.append(f"  Avg Confidence: {stats['avg_confidence']}")
+            report_lines.append(f"  Alerts: {stats['alerts_count']}, Flagged Decisions: {stats['anomaly_flags_count']}")
+        report_lines.append("")
+        report_lines.append("--- REGULATORY COMPLIANCE STATUS ---")
+        for reg, status in report_dict['regulatory_compliance'].items():
+            report_lines.append(f"  {reg}: {status}")
+        report_lines.append("")
+        report_lines.append("--- SIGN-OFF ---")
+        for role, details in report_dict['sign_off'].items():
+            report_lines.append(f"{role}: {details['name']} (Date: {details['date']})")
+            report_lines.append("  Signature: __________________________\n")
+        report_lines.append("=" * 80)
+        
+        report_text = "\n".join(report_lines)
+        
+        st.text_area("Audit report (preview)", value=report_text, height=460)
+        buf = io.BytesIO(report_text.encode("utf-8"))
         st.download_button(
-            label="Download Report as Text",
-            data=report_text,
-            file_name=f"AI_Model_Audit_Report_{datetime.now().strftime('%Y%m%d')}.md",
-            mime="text/markdown"
+            label="Download report (txt)",
+            data=buf,
+            file_name=f"audit_report_{start_ts.date()}_{end_ts.date()}.txt",
+            mime="text/plain",
         )
     else:
-        st.info("Click 'Generate Audit Report' to view its content for the selected period.")
+        st.caption("Click **Generate report (committee-ready)** to produce the governance artifact.")
 
 
 # License

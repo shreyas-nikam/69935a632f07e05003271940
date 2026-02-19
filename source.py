@@ -20,7 +20,7 @@ class AIDecisionLogger:
     """
     def __init__(self, db_path='ai_audit_log.db'):
         self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
+        self.conn = sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row # Allows accessing columns by name
         self._create_tables()
 
@@ -141,6 +141,8 @@ class AIDecisionLogger:
 # Initialize a global logger instance. This is used by the decorators
 # for AI models, allowing them to log decisions automatically.
 _global_decision_logger = AIDecisionLogger(db_path='finsecure_ai_audit_log.db')
+# Create an alias for compatibility with app.py imports
+logger = _global_decision_logger
 print(f"Initialized AI audit log database at '{_global_decision_logger.db_path}' with 'decisions' and 'alerts' tables.")
 
 def audit_logged(model_name, model_version, decision_type, logger_instance):
